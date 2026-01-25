@@ -186,6 +186,9 @@ fn process(
         .set_level(pdbtbx::StrictnessLevel::Loose)
         .read(input_file)
         .map_err(|errors| CLIError::InputFileRead { errors })?;
+
+    // Timing for SASA calculation only
+    let start = std::time::Instant::now();
     let result = calculate_sasa_and_wrap(
         &pdb,
         &output_depth,
@@ -199,6 +202,8 @@ fn process(
         read_radii_from_occupancy,
     )
     .context(SASACalculationSnafu)?;
+    let elapsed = start.elapsed();
+    eprintln!("SASA_TIME_US:{}", elapsed.as_micros());
 
     match format {
         OutputFormat::Xml => {
