@@ -143,6 +143,9 @@ pub enum CLIError {
     #[snafu(display("Failed to write output file: {source}"))]
     FileWrite { source: std::io::Error },
 
+    #[snafu(display("Failed to read input file: {source}"))]
+    FileRead { source: std::io::Error },
+
     #[snafu(display("Failed to load radii file: {source}"))]
     RadiiFileLoad { source: std::io::Error },
 
@@ -556,13 +559,13 @@ fn process_json_input(
 
     // Read file (with gzip support)
     let content = if json_path.ends_with(".gz") {
-        let file = std::fs::File::open(json_path).map_err(|e| CLIError::FileWrite { source: e })?;
+        let file = std::fs::File::open(json_path).map_err(|e| CLIError::FileRead { source: e })?;
         let mut decoder = GzDecoder::new(file);
         let mut content = String::new();
-        decoder.read_to_string(&mut content).map_err(|e| CLIError::FileWrite { source: e })?;
+        decoder.read_to_string(&mut content).map_err(|e| CLIError::FileRead { source: e })?;
         content
     } else {
-        std::fs::read_to_string(json_path).map_err(|e| CLIError::FileWrite { source: e })?
+        std::fs::read_to_string(json_path).map_err(|e| CLIError::FileRead { source: e })?
     };
 
     // Parse JSON
