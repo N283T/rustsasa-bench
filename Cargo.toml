@@ -27,10 +27,11 @@ serde_json = { version = "1.0.149", optional = true }
 quick-xml = { version = "0.39.0", features = ["serialize"], optional = true }
 indicatif = { version = "0.18.3", optional = true }
 mimalloc = { version = "0.1.48", default-features = false, optional = true }
+flate2 = { version = "1.0", optional = true }
 
 [features]
 default = []
-cli = ["dep:clap", "dep:indicatif", "dep:mimalloc", "serde_json", "quick-xml", "serde"]
+cli = ["dep:clap", "dep:indicatif", "dep:mimalloc", "serde_json", "quick-xml", "serde", "dep:flate2"]
 
 [[bin]]
 name = "rust-sasa"

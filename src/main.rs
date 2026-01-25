@@ -1,6 +1,7 @@
 // Copyright (c) 2024 Maxwell Campbell. Licensed under the MIT License.
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
+use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use pdbtbx::{PDBError, ReadOptions};
 use quick_xml::SeError as XmlError;
@@ -9,6 +10,7 @@ use rust_sasa::options::SASAOptions;
 use rust_sasa::structures::atomic::SASAResult;
 use rust_sasa::utils::configure_thread_pool;
 use rust_sasa::{sasa_result_to_json, sasa_result_to_protein_object, sasa_result_to_xml};
+use rust_sasa::{Atom, calculate_sasa_internal};
 use snafu::{ResultExt, Snafu};
 
 #[global_allocator]
@@ -56,12 +58,12 @@ impl OutputFormat {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// File to read from.
-    #[arg()]
+    /// File to read from (not required when using --json-input).
+    #[arg(default_value = "")]
     input: String,
 
-    /// Output file path.
-    #[arg()]
+    /// Output file path (not required when using --json-input).
+    #[arg(default_value = "")]
     output: String,
 
     /// Output depth. (i.e: protein, chain, residue, atom)
@@ -103,6 +105,10 @@ struct Args {
     /// When enabled, RustSASA will read Van der Waals radii from occupancy values in the PDB file. This overrides the radii file if provided.
     #[arg(short = 'R', long, default_value_t = false)]
     read_radii_from_occupancy: bool,
+
+    /// JSON input file for benchmarking (format: {"x":[], "y":[], "z":[], "r":[]}). Supports .json.gz
+    #[arg(short = 'J', long)]
+    json_input: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -145,6 +151,9 @@ pub enum CLIError {
 
     #[snafu(display("Input path appears to be a directory but does not exist: {path}"))]
     InputDirectoryNotFound { path: String },
+
+    #[snafu(display("Failed to parse JSON input: {message}"))]
+    JSONInputParse { message: String },
 }
 
 impl CLIError {
@@ -527,6 +536,71 @@ fn process_single_file(
     Ok(())
 }
 
+/// JSON input format for benchmarking
+#[derive(serde::Deserialize)]
+struct JsonInput {
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    r: Vec<f32>,
+}
+
+/// Process JSON input file for benchmarking (bypasses pdbtbx)
+fn process_json_input(
+    json_path: &str,
+    n_points: usize,
+    probe_radius: f32,
+    threads: isize,
+) -> Result<f32, CLIError> {
+    use std::io::Read;
+
+    // Read file (with gzip support)
+    let content = if json_path.ends_with(".gz") {
+        let file = std::fs::File::open(json_path).map_err(|e| CLIError::FileWrite { source: e })?;
+        let mut decoder = GzDecoder::new(file);
+        let mut content = String::new();
+        decoder.read_to_string(&mut content).map_err(|e| CLIError::FileWrite { source: e })?;
+        content
+    } else {
+        std::fs::read_to_string(json_path).map_err(|e| CLIError::FileWrite { source: e })?
+    };
+
+    // Parse JSON
+    let input: JsonInput = serde_json::from_str(&content)
+        .map_err(|e| CLIError::JSONInputParse { message: e.to_string() })?;
+
+    // Validate arrays
+    let n = input.x.len();
+    if n == 0 || input.y.len() != n || input.z.len() != n || input.r.len() != n {
+        return Err(CLIError::JSONInputParse {
+            message: format!(
+                "Arrays must be non-empty and same length (x={}, y={}, z={}, r={})",
+                input.x.len(), input.y.len(), input.z.len(), input.r.len()
+            ),
+        });
+    }
+
+    // Build atoms
+    let atoms: Vec<Atom> = (0..n)
+        .map(|i| Atom {
+            position: [input.x[i], input.y[i], input.z[i]],
+            radius: input.r[i],
+            id: i,
+            parent_id: None,
+        })
+        .collect();
+
+    // Calculate SASA with timing
+    let start = std::time::Instant::now();
+    let sasa_values = calculate_sasa_internal(&atoms, probe_radius, n_points, threads);
+    let elapsed = start.elapsed();
+    eprintln!("SASA_TIME_US:{}", elapsed.as_micros());
+
+    // Return total SASA
+    let total: f32 = sasa_values.iter().sum();
+    Ok(total)
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -536,6 +610,14 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), CLIError> {
+    // Handle JSON input mode (for benchmarking)
+    if let Some(json_path) = &args.json_input {
+        configure_thread_pool(args.threads).map_err(|e| CLIError::ThreadPool { source: e })?;
+        let total = process_json_input(json_path, args.n_points, args.probe_radius, args.threads)?;
+        println!("Total SASA: {:.2} Å²", total);
+        return Ok(());
+    }
+
     let input_path = std::path::Path::new(&args.input);
     let radii_file = args.radii_file.as_deref();
 
