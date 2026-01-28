@@ -109,6 +109,14 @@ struct Args {
     /// JSON input file for benchmarking (format: {"x":[], "y":[], "z":[], "r":[]}). Supports .json.gz
     #[arg(short = 'J', long)]
     json_input: Option<String>,
+
+    /// JSON input directory for batch benchmarking (processes all .json/.json.gz files)
+    #[arg(long)]
+    json_dir: Option<String>,
+
+    /// Output directory for batch JSON processing (required with --json-dir)
+    #[arg(long)]
+    output_dir: Option<String>,
 }
 
 #[derive(Debug, Snafu)]
@@ -604,6 +612,233 @@ fn process_json_input(
     Ok(total)
 }
 
+/// Result of processing a single JSON file
+#[allow(dead_code)] // Fields kept for potential per-file timing output
+struct JsonFileResult {
+    filename: String,
+    n_atoms: usize,
+    sasa_time_ns: u64,
+    total_sasa: f32,
+    success: bool,
+}
+
+/// Process JSON directory for batch benchmarking
+fn process_json_directory(
+    input_dir: &str,
+    output_dir: &str,
+    n_points: usize,
+    probe_radius: f32,
+    _threads: isize, // Not used - we use file-level parallelism with single-threaded SASA per file
+) -> Result<(), CLIError> {
+    use rayon::prelude::*;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    ensure_output_directory(output_dir)?;
+
+    // Collect JSON files
+    let files: Vec<_> = std::fs::read_dir(input_dir)
+        .map_err(|e| CLIError::DirectoryRead { source: e })?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name()?.to_str()?;
+                if name.ends_with(".json") || name.ends_with(".json.gz") {
+                    return Some(path);
+                }
+            }
+            None
+        })
+        .collect();
+
+    let total_files = files.len();
+    if total_files == 0 {
+        eprintln!("No .json or .json.gz files found in {}", input_dir);
+        return Ok(());
+    }
+
+    let processed_count = AtomicU64::new(0);
+    let total_sasa_time_ns = AtomicU64::new(0);
+    let results = Mutex::new(Vec::with_capacity(total_files));
+
+    // Create progress bar
+    let pb = ProgressBar::new(total_files as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .expect("Progress bar template should be valid")
+            .progress_chars("#>-"),
+    );
+
+    // Process files in parallel with file-level parallelism (single-threaded SASA per file)
+    files.par_iter().for_each(|path| {
+        let filename = path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+
+        // Read and decompress file
+        let content = if filename.ends_with(".gz") {
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => {
+                    results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+                        filename: filename.to_string(),
+                        n_atoms: 0,
+                        sasa_time_ns: 0,
+                        total_sasa: 0.0,
+                        success: false,
+                    });
+                    pb.inc(1);
+                    return;
+                }
+            };
+            let mut decoder = GzDecoder::new(file);
+            let mut content = String::new();
+            if decoder.read_to_string(&mut content).is_err() {
+                results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+                    filename: filename.to_string(),
+                    n_atoms: 0,
+                    sasa_time_ns: 0,
+                    total_sasa: 0.0,
+                    success: false,
+                });
+                pb.inc(1);
+                return;
+            }
+            content
+        } else {
+            match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => {
+                    results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+                        filename: filename.to_string(),
+                        n_atoms: 0,
+                        sasa_time_ns: 0,
+                        total_sasa: 0.0,
+                        success: false,
+                    });
+                    pb.inc(1);
+                    return;
+                }
+            }
+        };
+
+        // Parse JSON
+        let input: JsonInput = match serde_json::from_str(&content) {
+            Ok(i) => i,
+            Err(_) => {
+                results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+                    filename: filename.to_string(),
+                    n_atoms: 0,
+                    sasa_time_ns: 0,
+                    total_sasa: 0.0,
+                    success: false,
+                });
+                pb.inc(1);
+                return;
+            }
+        };
+
+        // Validate arrays
+        let n = input.x.len();
+        if n == 0 || input.y.len() != n || input.z.len() != n || input.r.len() != n {
+            results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+                filename: filename.to_string(),
+                n_atoms: 0,
+                sasa_time_ns: 0,
+                total_sasa: 0.0,
+                success: false,
+            });
+            pb.inc(1);
+            return;
+        }
+
+        // Build atoms
+        let atoms: Vec<Atom> = (0..n)
+            .map(|i| Atom {
+                position: [input.x[i], input.y[i], input.z[i]],
+                radius: input.r[i],
+                id: i,
+                parent_id: None,
+            })
+            .collect();
+
+        // Calculate SASA with timing (single-threaded per file for fair comparison)
+        let start = std::time::Instant::now();
+        let sasa_values = calculate_sasa_internal(&atoms, probe_radius, n_points, 1);
+        let elapsed = start.elapsed();
+        let sasa_time_ns = elapsed.as_nanos() as u64;
+
+        let total_sasa: f32 = sasa_values.iter().sum();
+
+        // Write output
+        let output_filename = if filename.ends_with(".json.gz") {
+            filename.strip_suffix(".gz").unwrap_or(filename)
+        } else {
+            filename
+        };
+        let output_path = std::path::Path::new(output_dir).join(output_filename);
+
+        #[derive(serde::Serialize)]
+        struct JsonOutput {
+            total_area: f32,
+            atom_areas: Vec<f32>,
+        }
+
+        let output = JsonOutput {
+            total_area: total_sasa,
+            atom_areas: sasa_values,
+        };
+
+        let success = if let Ok(json) = serde_json::to_string_pretty(&output) {
+            std::fs::write(&output_path, json).is_ok()
+        } else {
+            false
+        };
+
+        // Update counters
+        total_sasa_time_ns.fetch_add(sasa_time_ns, Ordering::Relaxed);
+        processed_count.fetch_add(1, Ordering::Relaxed);
+
+        results.lock().expect("Mutex should not be poisoned").push(JsonFileResult {
+            filename: filename.to_string(),
+            n_atoms: n,
+            sasa_time_ns,
+            total_sasa,
+            success,
+        });
+
+        pb.inc(1);
+    });
+
+    pb.finish_with_message("Processing complete!");
+
+    // Collect results
+    let results = results.into_inner().unwrap();
+    let successful = results.iter().filter(|r| r.success).count();
+    let failed = results.len() - successful;
+    let total_sasa_time = total_sasa_time_ns.load(Ordering::Relaxed);
+
+    // Output benchmark format to stderr
+    eprintln!("BATCH_SASA_TIME_MS:{:.2}", total_sasa_time as f64 / 1_000_000.0);
+    eprintln!("BATCH_FILES:{}", total_files);
+    eprintln!("BATCH_SUCCESSFUL:{}", successful);
+    eprintln!("BATCH_FAILED:{}", failed);
+
+    // Summary to stdout
+    println!("\nBatch processing complete:");
+    println!("  Total files:  {}", total_files);
+    println!("  Successful:   {}", successful);
+    println!("  Failed:       {}", failed);
+    println!("  SASA time:    {:.2} ms", total_sasa_time as f64 / 1_000_000.0);
+
+    Ok(())
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -613,6 +848,26 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), CLIError> {
+    // Handle JSON directory mode (batch benchmarking)
+    if let Some(json_dir) = &args.json_dir {
+        let output_dir = args.output_dir.as_ref().ok_or_else(|| {
+            CLIError::DirectoryRead {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--output-dir is required when using --json-dir",
+                ),
+            }
+        })?;
+        configure_thread_pool(args.threads).map_err(|e| CLIError::ThreadPool { source: e })?;
+        return process_json_directory(
+            json_dir,
+            output_dir,
+            args.n_points,
+            args.probe_radius,
+            args.threads,
+        );
+    }
+
     // Handle JSON input mode (for benchmarking)
     if let Some(json_path) = &args.json_input {
         configure_thread_pool(args.threads).map_err(|e| CLIError::ThreadPool { source: e })?;
