@@ -663,6 +663,9 @@ fn process_json_directory(
     let total_sasa_time_ns = AtomicU64::new(0);
     let results = Mutex::new(Vec::with_capacity(total_files));
 
+    // Start total time measurement (includes I/O)
+    let total_start = std::time::Instant::now();
+
     // Create progress bar
     let pb = ProgressBar::new(total_files as u64);
     pb.set_style(
@@ -822,9 +825,11 @@ fn process_json_directory(
     let successful = results.iter().filter(|r| r.success).count();
     let failed = results.len() - successful;
     let total_sasa_time = total_sasa_time_ns.load(Ordering::Relaxed);
+    let total_time_ms = total_start.elapsed().as_secs_f64() * 1000.0;
 
     // Output benchmark format to stderr
     eprintln!("BATCH_SASA_TIME_MS:{:.2}", total_sasa_time as f64 / 1_000_000.0);
+    eprintln!("BATCH_TOTAL_TIME_MS:{:.2}", total_time_ms);
     eprintln!("BATCH_FILES:{}", total_files);
     eprintln!("BATCH_SUCCESSFUL:{}", successful);
     eprintln!("BATCH_FAILED:{}", failed);
@@ -835,6 +840,7 @@ fn process_json_directory(
     println!("  Successful:   {}", successful);
     println!("  Failed:       {}", failed);
     println!("  SASA time:    {:.2} ms", total_sasa_time as f64 / 1_000_000.0);
+    println!("  Total time:   {:.2} ms (includes I/O)", total_time_ms);
 
     Ok(())
 }
